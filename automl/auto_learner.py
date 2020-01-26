@@ -369,6 +369,47 @@ class AutoLearner:
             if self.verbose:
                 print("Insufficient time in this round.")
 
+    def _greedy_initial_selection(self, x_train, y_train, t_predicted, runtime_limit):
+        if self.verbose:
+            print("Initial stage: fitting fast pipelines that perform well on average.")
+
+        candidate_pipeline_indices = list(set(np.where(t_predicted <= runtime_limit / 8)[0]).intersection(
+            set(np.argsort(np.nanmedian(tl.unfold(self.error_tensor_imputed, mode=0), axis=0))[
+                :int(len(self.pipeline_settings_on_dataset)/50)])))
+
+
+        candidate_pipelines = [PipelineObject(p_type=self.p_type, config=self.pipeline_settings_on_dataset[i], index=i, verbose=self.verbose) for i in candidate_pipeline_indices]
+
+        p1 = mp.Pool(self.n_cores)
+        candidate_pipeline_errors = [p1.apply_async(PipelineObject.kfold_fit_validate, args=[p, x_train, y_train, self.n_folds, runtime_limit/4, self.random_state]) for p in candidate_pipelines]
+        p1.close()
+        p1.join()
+
+        if self.verbose:
+            print("Initial greedy fitting completed")
+
+
+        for i, error in enumerate(candidate_pipeline_errors):
+            cv_error, cv_predictions, t_elapsed = error.get()
+            if not np.isnan(cv_error):
+                candidate_pipelines[i].cv_error, candidate_pipelines[i].cv_predictions = cv_error, cv_predictions
+                candidate_pipelines[i].sampled = True
+                self.new_row[:, candidate_pipeline_indices[i]] = cv_error
+                self.sampled_pipelines[candidate_pipeline_indices[i]] = candidate_pipelines[i]
+                self.ensemble.candidate_learners.append(candidate_pipelines[i])                    
+                # update sampled indices
+                self.sampled_indices = self.sampled_indices.union(set([candidate_pipeline_indices[i]]))
+                self._t_predicted[candidate_pipeline_indices[i]] = t_elapsed
+            else:
+                self._t_predicted[candidate_pipeline_indices[i]] = max(t_elapsed, self._t_predicted[candidate_pipeline_indices[i]])
+
+        if len(self.ensemble.candidate_learners) > 0:
+            self.ensemble.fitted = True        
+            self.ensemble.fit(x_train, y_train)
+        else:
+            if self.verbose:
+                print("Insufficient time to fit fast and on average best-performing pipelines.")
+            
             
     def fit(self, x_train, y_train, verbose=False):
 
@@ -430,6 +471,8 @@ class AutoLearner:
         
         
         start = time.time()
+        
+        self._greedy_initial_selection(x_tr, y_tr, self._t_predicted, self.runtime_limit/8)
 
         ranks = [linalg.approx_tensor_rank(self.error_tensor_imputed, threshold=0.05)]
 #         if self.build_ensemble:
